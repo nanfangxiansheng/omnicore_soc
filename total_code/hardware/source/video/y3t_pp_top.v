@@ -1,0 +1,193 @@
+// ============================================================================
+// y3t_pp_top.v — 预处理模块的 "方案 A" 集成外壳
+//
+// 方案 A (2026-10-19 用户选定)
+//   相机像素域 (camera_clk) 里完成 letterbox + 量化,
+//   再经异步 FIFO 跨到 SoC 域 (soc_clk), 由 SoC 域直接写 y3tram 的 IN 区。
+//
+//   为什么不在相机域直接写 y3tram: y3tram 是 SoC 私有 SRAM, 写口挂在 soc_clk
+//   一侧的地址译码上; 而且 IN 区将来要和引擎的读时序共用仲裁。跨过来写最干净,
+//   代价只是一个 270bit 宽的异步 FIFO (256 深, 约 2 DRM)。
+// ============================================================================
+`default_nettype none
+
+module y3t_pp_top #(
+    parameter SRC_W      = 1280,
+    parameter SRC_H      = 720,
+    parameter DST        = 96,
+    parameter IMG_TOP    = 21,
+    parameter IMG_H      = 54,
+    parameter PAD_VAL    = 114,
+    parameter ADDR_W     = 14,
+    parameter FIFO_LOG2  = 8          // 256 深
+) (
+    // ---------------- 相机像素域 ----------------
+    input  wire              cam_clk,
+    input  wire              rst_n,
+    input  wire              vsync,
+    input  wire              de,
+    input  wire [15:0]       pix,
+
+    // ---------------- SoC 域 ----------------
+    input  wire              soc_clk,
+    input  wire              soc_rst_n,
+    input  wire              arm,        // SoC 侧 CSR, 1=允许写 IN 区
+    input  wire              eng_grant,  // 仲裁授权 (轮到我才为 1)
+
+    // y3tram eng 写口 (SoC 域, 对齐 y3t_mem_ahb 时序)
+    output wire              eng_req,
+    output wire [ADDR_W-1:0] eng_addr,
+    output wire [255:0]      eng_wdata,
+
+    // 状态回读 (SoC 域)
+    output wire [7:0]        frame_cnt,
+    output wire              pad_done,
+    output wire              fifo_ovf,    // 1 = 发生过 FIFO 满 (诊断用)
+
+    // 调试观测 (相机域, 可接 ILA: 看行/列/相位推进是否正常)
+    output wire [15:0]       sy_dbg,
+    output wire [15:0]       sx_dbg,
+    output wire [15:0]       yp_dbg,
+    output wire [7:0]        xd_dbg,
+    output wire [1:0]        st_dbg,
+    output wire              last_dbg     // 本帧最后一个字的单拍脉冲
+);
+
+    // ========================================================================
+    // 1. 预处理核心 (相机域)
+    // ========================================================================
+    wire [255:0]      pp_word;
+    wire [ADDR_W-1:0] pp_addr;
+    wire              pp_valid;
+    wire              pp_ready;
+    wire              pp_pad_done;
+    wire [7:0]        pp_frame_cnt;
+
+    // arm: soc_clk → cam_clk (2FF)
+    reg arm_s1, arm_s2;
+    always @(posedge cam_clk or negedge rst_n) begin
+        if (!rst_n) begin arm_s1 <= 1'b0; arm_s2 <= 1'b0; end
+        else        begin arm_s1 <= arm; arm_s2 <= arm_s1; end
+    end
+
+    y3t_preprocess #(
+        .SRC_W(SRC_W), .SRC_H(SRC_H), .DST(DST),
+        .IMG_TOP(IMG_TOP), .IMG_H(IMG_H), .PAD_VAL(PAD_VAL),
+        .ADDR_W(ADDR_W)
+    ) u_pp (
+        .clk(cam_clk), .rst_n(rst_n),
+        .vsync(vsync), .de(de), .pix(pix),
+        .arm(arm_s2),
+        .out_word(pp_word), .out_addr(pp_addr),
+        .out_valid(pp_valid), .out_ready(pp_ready), .out_last(last_dbg),
+        .frame_cnt(pp_frame_cnt), .pad_done(pp_pad_done),
+        .sy_dbg(sy_dbg), .sx_dbg(sx_dbg), .st_dbg(st_dbg),
+        .yp_dbg(yp_dbg), .xd_dbg(xd_dbg)
+    );
+
+    // ========================================================================
+    // 2. 跨域 FIFO: 载荷 = {地址, 字}
+    // ========================================================================
+    localparam FIFO_W = ADDR_W + 256;
+
+    wire              fifo_full;
+    wire [FIFO_LOG2:0] fifo_cnt;
+    wire              fifo_empty;
+    wire [FIFO_W-1:0] fifo_dout;
+    wire              fifo_rd_en;
+
+    assign pp_ready = ~fifo_full;
+
+    reg fifo_ovf_r;
+    always @(posedge cam_clk or negedge rst_n) begin
+        if (!rst_n) fifo_ovf_r <= 1'b0;
+        else if (pp_valid && fifo_full) fifo_ovf_r <= 1'b1;
+    end
+    assign fifo_ovf = fifo_ovf_r;
+
+    async_fifo_dc #(
+        .WIDTH(FIFO_W),
+        .DEPTH_LOG2(FIFO_LOG2),
+        .OUTREG(1)
+    ) u_fifo (
+        .wr_clk(cam_clk), .wr_rst_n(rst_n),
+        .wr_en(pp_valid), .wr_data({pp_addr, pp_word}),
+        .full(fifo_full), .wr_data_count(fifo_cnt),
+        .rd_clk(soc_clk), .rd_rst_n(soc_rst_n),
+        .rd_en(fifo_rd_en), .rd_data(fifo_dout),
+        .empty(fifo_empty)
+    );
+
+    // ========================================================================
+    // 3. SoC 侧: FIFO 弹出 → eng 写口 (单字写, 数据在 req+ack 两拍内保持稳定)
+    // ========================================================================
+    // async_fifo_dc 用 OUTREG=1: rd_en 拍后一拍 rd_data 才有效, 且在下次
+    // 弹出前保持不变 —— 正好满足 "req+ack 两拍稳定" 的要求。
+    localparam [1:0] P_IDLE = 2'd0, P_POP = 2'd1, P_DRV = 2'd2;
+
+    reg  [1:0]       pst;
+    reg              rd_en_r;
+    reg  [1:0]       dcnt;
+
+    assign fifo_rd_en = rd_en_r;
+
+    always @(posedge soc_clk or negedge soc_rst_n) begin
+        if (!soc_rst_n) begin
+            pst     <= P_IDLE;
+            rd_en_r <= 1'b0;
+            dcnt    <= 2'd0;
+        end else begin
+            case (pst)
+            P_IDLE: begin
+                rd_en_r <= 1'b0;
+                if (~fifo_empty && eng_grant) begin
+                    rd_en_r <= 1'b1;
+                    pst     <= P_POP;
+                end
+            end
+            P_POP: begin                       // rd_data 在本拍之后的下一拍有效
+                rd_en_r <= 1'b0;
+                dcnt    <= 2'd1;
+                pst     <= P_DRV;
+            end
+            P_DRV: begin                       // eng_req 拉 2 拍 (req + ack)
+                if (dcnt == 2'd0) begin
+                    if (~fifo_empty && eng_grant) begin
+                        rd_en_r <= 1'b1;
+                        pst     <= P_POP;
+                    end else begin
+                        pst <= P_IDLE;
+                    end
+                end else begin
+                    dcnt <= dcnt - 2'd1;
+                end
+            end
+            default: pst <= P_IDLE;
+            endcase
+        end
+    end
+
+    assign eng_req   = (pst == P_DRV);
+    assign eng_addr  = fifo_dout[FIFO_W-1:256];
+    assign eng_wdata = fifo_dout[255:0];
+
+    // ========================================================================
+    // 4. 状态跨回 soc_clk
+    // ========================================================================
+    reg [7:0] fc_s1, fc_s2;
+    reg       pd_s1, pd_s2;
+    always @(posedge soc_clk or negedge soc_rst_n) begin
+        if (!soc_rst_n) begin
+            fc_s1 <= 8'd0; fc_s2 <= 8'd0;
+            pd_s1 <= 1'b0; pd_s2 <= 1'b0;
+        end else begin
+            fc_s1 <= pp_frame_cnt; fc_s2 <= fc_s1;
+            pd_s1 <= pp_pad_done;  pd_s2 <= pd_s1;
+        end
+    end
+    assign frame_cnt = fc_s2;
+    assign pad_done  = pd_s2;
+
+endmodule
+
+`default_nettype wire

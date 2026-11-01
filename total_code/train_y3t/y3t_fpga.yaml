@@ -1,0 +1,42 @@
+# Ultralytics YOLOv3-tiny — Y3T-F FPGA 友好重构版 (SPEC-Y3T-01)
+# 基于 ultralytics 8.4.161 cfg/models/v3/yolov3-tiny.yaml 修改:
+#   1. nc 80 → 7 (colorblocks2 演示集)
+#   2. width_multiple 1.0 → 0.5 (宽度减半, S4)
+#   3. 删除原 11/12 层 (ZeroPad2d + MaxPool(2,1,0)): 416 奇数尺寸专用,
+#      不在引擎算子闭集内; 96² 下 backbone 直出 3×3 P5 特征 (S3)
+#   4. Detect 由 patches_y3t.py 注入 DetectFPGA (one2one/reg_max=1/cv3 普通 3×3)
+# 激活由 patches_y3t.py 置 ReLU (S5)。y3t_fpga.yaml 本身保持官方语法。
+
+# Parameters
+nc: 7 # number of classes (colorblocks2)
+depth_multiple: 1.0 # model depth multiple
+width_multiple: 0.5 # layer channel multiple (S4: 宽度减半)
+reg_max: 1 # 直接回归 (S6, parse_model 顶层键 → Detect 构造参数)
+end2end: true # one2one NMS-free (S6)
+
+# YOLOv3-tiny backbone (Y3T-F)
+backbone:
+  # [from, number, module, args]
+  - [-1, 1, Conv, [16, 3, 1]] # 0: 96x96x8
+  - [-1, 1, nn.MaxPool2d, [2, 2, 0]] # 1-P1/2: 48x48
+  - [-1, 1, Conv, [32, 3, 1]] # 2
+  - [-1, 1, nn.MaxPool2d, [2, 2, 0]] # 3-P2/4: 24x24
+  - [-1, 1, Conv, [64, 3, 1]] # 4
+  - [-1, 1, nn.MaxPool2d, [2, 2, 0]] # 5-P3/8: 12x12
+  - [-1, 1, Conv, [128, 3, 1]] # 6
+  - [-1, 1, nn.MaxPool2d, [2, 2, 0]] # 7-P4/16: 6x6
+  - [-1, 1, Conv, [256, 3, 1]] # 8
+  - [-1, 1, nn.MaxPool2d, [2, 2, 0]] # 9-P5/32: 3x3
+  - [-1, 1, Conv, [512, 3, 1]] # 10
+  - [-1, 1, Conv, [1024, 3, 1]] # 11 (原 13; 原 11/12 pad+pool 已删, S3)
+  - [-1, 1, Conv, [256, 1, 1]] # 12 (原 14)
+  - [-1, 1, Conv, [512, 3, 1]] # 13 (P5/32-large, 原 15)
+
+# YOLOv3-tiny head (Y3T-F)
+head:
+  - [-2, 1, Conv, [128, 1, 1]] # 14 (原 16, from=12)
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 15: 3x3 → 6x6
+  - [[-1, 8], 1, Concat, [1]] # 16: cat backbone P4 (6x6)
+  - [-1, 1, Conv, [256, 3, 1]] # 17 (P4/16-medium, 原 19)
+
+  - [[17, 13], 1, Detect, [nc]] # Detect(P4, P5) → DetectFPGA (patches_y3t)
